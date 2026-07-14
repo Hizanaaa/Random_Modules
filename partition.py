@@ -1,161 +1,151 @@
 """
 Reviewer Note
-=============
-This module provides a single-pass helper for splitting an iterable into
-matching and non-matching items according to a predicate.
+-------------
+Design choices:
 
-Semantic decisions
-------------------
-1. Returns two eager lists, not lazy iterators.
-   This implementation intentionally returns a tuple of two lists:
-   (matches, non_matches). While itertools.tee() could be used to produce
-   lazy iterators, tee() may require unbounded buffering if the two
-   iterators are consumed at different rates. Returning eager lists provides
-   predictable memory behaviour and matches the common "split into two
-   collections" use case.
+- The function returns two lists: (matches, non_matches).
+  This intentionally materializes both partitions so callers
+  can freely inspect, count, iterate, or reuse either bucket
+  without re-running the predicate or re-consuming the input.
 
-2. Original order is preserved.
-   Both the matching and non-matching lists preserve the original order
-   of items from the input iterable.
+- Single-pass implementation. The iterable is consumed exactly
+  once and the predicate is evaluated exactly once per item.
+  This avoids the common mistake of filtering twice, which is
+  both inefficient and incorrect for generators.
 
-3. Predicate evaluated exactly once per item.
-   Each element is visited once, and pred(item) is called exactly once.
+- Predicate exceptions propagate directly to the caller.
+  If predicate(item) raises, partition() raises immediately.
+  The partially-filled lists are discarded, not returned —
+  the function makes no guarantees about intermediate state
+  during failure.
 
-4. Truthiness determines membership.
-   Any truthy predicate result places an item into the matching list;
-   the result is not compared using == True.
+- Order is preserved within each bucket. Items appear in the
+  same relative order they appeared in the original iterable.
 
-5. Empty iterables return two empty lists.
+- The decision is based on bool(predicate(item)).
+  Predicate results do not need to be literal booleans.
+  Any truthy value places the item in matches; any falsy value
+  places it in non_matches.
 
-6. The iterable is consumed exactly once, making generator inputs
-   fully supported.
+Test gaps:
+- Infinite iterables are not tested because the function
+  intentionally materializes both output lists and therefore
+  requires a finite input to terminate.
 
-7. A non-callable predicate raises TypeError.
+- Predicates with side effects beyond simple counting are not
+  tested because the implementation guarantees exactly one
+  invocation per item through a straightforward single-pass loop.
 
-8. Exceptions raised by the predicate propagate unchanged.
-
-9. Implementation uses a single loop with one append per item for clarity
-   and efficiency.
-
-Test gaps
----------
-1. Very large iterables were not performance benchmarked.
-2. Custom iterable classes with unusual iteration behaviour were not tested.
-3. Thread-safety was not evaluated because the function maintains no shared
-   state.
+- Very large iterables are not tested separately. Behavior is
+  identical to small inputs aside from memory consumption, which
+  is inherent to returning materialized lists.
 """
 
-from typing import Callable, Iterable, TypeVar
+from collections.abc import Callable, Iterable
+from typing import TypeVar
 
 T = TypeVar("T")
 
 
 def partition(
-    pred: Callable[[T], bool],
     iterable: Iterable[T],
+    predicate: Callable[[T], bool],
 ) -> tuple[list[T], list[T]]:
     """
-    Split iterable into two lists based on pred.
+    Split iterable into (matches, non_matches) lists based on
+    predicate(item).
 
-    Returns (matches, non_matches) where the first list contains items
-    whose predicate value is truthy and the second contains those whose
-    predicate value is falsy. Each item is visited exactly once and the
-    predicate is called exactly once per item.
-
-    Raises:
-        TypeError: If pred is not callable.
+    The iterable is consumed exactly once. Predicate exceptions
+    propagate to the caller.
     """
-    if not callable(pred):
-        raise TypeError("pred must be callable")
-
     matches: list[T] = []
     non_matches: list[T] = []
 
-    for item in iterable:
-        (matches if pred(item) else non_matches).append(item)
+    for item in iter(iterable):
+        if bool(predicate(item)):
+            matches.append(item)
+        else:
+            non_matches.append(item)
 
     return matches, non_matches
 
 
 if __name__ == "__main__":
+    # even/odd split
+    matches, non_matches = partition(range(10), lambda x: x % 2 == 0)
+    assert matches == [0, 2, 4, 6, 8]
+    assert non_matches == [1, 3, 5, 7, 9]
 
-    # Basic
-    assert partition(lambda x: x > 5, [3, 8, 1, 9, 4, 7]) == (
-        [8, 9, 7],
-        [3, 1, 4],
-    )
+    # empty iterable
+    assert partition([], lambda x: True) == ([], [])
 
-    # Order preserved
-    m, n = partition(lambda x: x % 2 == 0, [6, 1, 4, 3, 2, 5])
-    assert m == [6, 4, 2]
-    assert n == [1, 3, 5]
+    # all items match
+    assert partition([1, 2, 3], lambda x: True) == ([1, 2, 3], [])
+    
+    # no items match
+    assert partition([1, 2, 3], lambda x: False) == ([], [1, 2, 3])
 
-    # All match
-    assert partition(lambda x: True, [1, 2, 3]) == ([1, 2, 3], [])
+    # generator input exhausted after consumption
+    gen = (x for x in range(5))
+    assert partition(gen, lambda x: x < 3) == ([0, 1, 2], [3, 4])
+    assert list(gen) == []
 
-    # None match
-    assert partition(lambda x: False, [1, 2, 3]) == ([], [1, 2, 3])
+    # predicate called exactly once per item
+    calls = {"count": 0}
 
-    # Empty iterable
-    assert partition(lambda x: x > 0, []) == ([], [])
+    def counting_predicate(x):
+        calls["count"] += 1
+        return x % 2 == 0
 
-    # String iterable
-    assert partition(str.isdigit, "a1b2c3") == (
-        ["1", "2", "3"],
-        ["a", "b", "c"],
-    )
+    data = [1, 2, 3, 4, 5]
+    partition(data, counting_predicate)
+    assert calls["count"] == len(data)
 
-    # Truthy return
-    assert partition(lambda x: x % 2, [1, 2, 3, 4]) == (
-        [1, 3],
-        [2, 4],
-    )
+    # predicate exception propagates
+    def raising_predicate(x):
+        if x == 3:
+            raise ValueError("boom")
+        return True
 
-    # Returns exactly a 2-tuple
-    t = partition(lambda x: x > 0, [1, -1])
-    assert type(t) is tuple
-    assert len(t) == 2
-
-    # Both halves are lists
-    assert type(t[0]) is list
-    assert type(t[1]) is list
-
-    # Predicate called exactly once per item
-    count = 0
-
-    def counting_pred(x: int) -> bool:
-        nonlocal_count[0] += 1
-        return x > 0
-
-    nonlocal_count = [0]
-    partition(counting_pred, range(6))
-    assert nonlocal_count[0] == 6
-
-    # Non-callable predicate
-    for bad in (None, 5):
-        try:
-            partition(bad, [1, 2, 3])  # type: ignore[arg-type]
-            assert False
-        except Exception as exc:
-            assert type(exc) is TypeError
-
-    # Predicate exception propagates unchanged
     try:
-        partition(lambda x: 1 / 0, [1, 2, 3])
-        assert False
-    except Exception as exc:
-        assert type(exc) is ZeroDivisionError
+        partition([1, 2, 3, 4], raising_predicate)
+        assert False, "Expected ValueError"
+    except ValueError:
+        pass
 
-    # Generator input (single pass)
-    visits = [0]
+    # truthy/falsy non-bool values (0/1)
+    matches, non_matches = partition(
+        [0, 1, 2, 3, 4],
+        lambda x: x % 2,
+    )
+    assert matches == [1, 3]
+    assert non_matches == [0, 2, 4]
 
-    def generator():
-        for i in range(5):
-            visits[0] += 1
-            yield i
+    # truthy/falsy containers
+    matches, non_matches = partition(
+        [4, 5, 6, 7],
+        lambda x: [x] if x > 5 else [],
+    )
+    assert matches == [6, 7]
+    assert non_matches == [4, 5]
 
-    result = partition(lambda x: x < 3, generator())
-    assert result == ([0, 1, 2], [3, 4])
-    assert visits[0] == 5
+    # unhashable items
+    records = [
+        {"name": "Alice", "active": True},
+        {"name": "Bob", "active": False},
+        {"name": "Carol", "active": True},
+    ]
+    matches, non_matches = partition(
+        records,
+        lambda r: r["active"],
+    )
+    assert matches == [records[0], records[2]]
+    assert non_matches == [records[1]]
+
+    # builtin bool predicate
+    data = [0, 1, "", "x", None, [], [1]]
+    matches, non_matches = partition(data, bool)
+    assert matches == [1, "x", [1]]
+    assert non_matches == [0, "", None, []]
 
     print("All tests passed.")
